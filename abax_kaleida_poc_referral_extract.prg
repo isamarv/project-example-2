@@ -207,12 +207,8 @@ join sa
         where s2.sch_event_id = sa.sch_event_id
       )
 
-join oa
-  where oa.order_id = outerjoin(ord.order_id)
-
 join c
-  where c.encntr_id = outerjoin(ord.encntr_id)
-    and c.ord_phys_id = outerjoin(oa.order_provider_id)
+  where c.order_id = outerjoin(ord.order_id)
 
 join cmCPT
   where cmCPT.charge_item_id = outerjoin(c.charge_item_id)
