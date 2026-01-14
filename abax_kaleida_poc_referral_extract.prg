@@ -97,7 +97,6 @@ from
   referral_entity_reltn rer,
   sch_event se,
   sch_appt sa,
-  order_action oa,
   charge c,
   charge_mod cmCPT,
   charge_mod cmICD
