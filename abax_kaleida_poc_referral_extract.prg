@@ -151,17 +151,17 @@ join eaMRN
       )
 
 join pe
-  where pe.encntr_id = e.encntr_id
+  where pe.encntr_id = outerjoin(e.encntr_id)
 
 join bo
-  where bo.pft_encntr_id = pe.pft_encntr_id
+  where bo.pft_encntr_id = outerjoin(pe.pft_encntr_id)
 
 join bhr
-  where bhr.benefit_order_id = bo.benefit_order_id
-    and bhr.priority_seq = 1
+  where bhr.benefit_order_id = outerjoin(bo.benefit_order_id)
+    and bhr.priority_seq = outerjoin(1)
 
 join hp
-  where hp.health_plan_id = bhr.health_plan_id
+  where hp.health_plan_id = outerjoin(bhr.health_plan_id)
 
 join o
   where o.organization_id = outerjoin(r.refer_from_organization_id)
