@@ -1,8 +1,50 @@
-# Cerner Millennium Referral Data Extract
+# Cerner Millennium Referral & Future Orders Data Extract
 
 ## Overview
 
-This document explains the CCL script for extracting referral data from Cerner Millennium, addressing the two key concerns raised by the team.
+This document explains the CCL scripts for extracting referral and order data from Cerner Millennium.
+
+---
+
+## CRITICAL: Understanding the Two Data Workflows
+
+In integrated Cerner Millennium environments (ambulatory offices + acute hospitals), there are **TWO SEPARATE WORKFLOWS** for patient referrals/orders:
+
+### Workflow 1: Referral Management (Specialist Referrals)
+- **Data Location:** `referral` table
+- **Use Case:** Sending patients to other providers (specialists)
+- **Script:** `cerner_millennium_referral_extract.ccl`
+- **What it captures:** Consult requests, specialist referrals, provider-to-provider transfers
+
+### Workflow 2: Future Orders (Labs, Imaging, Diagnostics)
+- **Data Location:** `orders` table (with FUTURE order status)
+- **Use Case:** Labs, imaging (CT, MRI, X-ray), diagnostic tests
+- **Script:** `cerner_millennium_future_orders_extract.ccl`
+- **What it captures:** Lab orders, radiology orders, diagnostic tests
+
+### Why This Matters
+
+| Order Type | Goes Through Referral Table? | Goes Through Scheduling? |
+|------------|------------------------------|--------------------------|
+| Specialist consult | ✅ Yes | Sometimes |
+| Lab order | ❌ No (Future Order) | Rarely |
+| CT/MRI | ❌ No (Future Order) | Usually yes |
+| X-ray | ❌ No (Future Order) | Rarely |
+| Ultrasound | ❌ No (Future Order) | Sometimes |
+
+**If you only run the referral extract, you will MISS all labs and most imaging orders!**
+
+---
+
+## Which Script Do You Need?
+
+| Scope | Script(s) to Use |
+|-------|------------------|
+| Specialist referrals only | `cerner_millennium_referral_extract.ccl` |
+| Labs and imaging only | `cerner_millennium_future_orders_extract.ccl` |
+| All referrals + labs + imaging | **Both scripts** |
+
+---
 
 ---
 
@@ -160,10 +202,88 @@ SELECT INTO "your_output_file.csv"
 
 ---
 
+## Future Orders Extract (Labs/Imaging)
+
+The `cerner_millennium_future_orders_extract.ccl` script captures orders that bypass the referral table.
+
+### Key Fields in Future Orders Extract
+
+| Field | Description |
+|-------|-------------|
+| `order_type` | Type of order |
+| `activity_type` | Activity classification (RADIOLOGY, LABORATORY, etc.) |
+| `clinical_category` | Clinical category of the service |
+| `order_status` | Current status (FUTURE, ORDERED, PENDING, COMPLETED) |
+| `future_order_flag` | Y/N indicator if this is a future order |
+| `scheduling_exists` | Y/N indicator if order has been scheduled |
+| `scheduling_status` | Status of appointment (if scheduled) |
+
+### Activity Types Captured
+
+The future orders script filters on these activity type meanings (code set 106):
+- `RADIOLOGY` - Imaging orders
+- `LABORATORY` - Lab orders
+- `PATHOLOGY` - Pathology orders
+- `CARDIOLOGY` - Cardiac diagnostics
+- `GENERAL` - General diagnostics
+
+**Note:** You may need to adjust these based on CHS's specific code set values.
+
+### Linking Ambulatory to Acute
+
+The script tracks both:
+- **Originating Encounter** (`originating_encntr_id`) - The ambulatory visit where order was placed
+- **Target Encounter** (`encntr_id`) - The hospital encounter where service is performed
+
+---
+
+## Combining Both Extracts
+
+If you need a unified view, run both scripts and combine results. Key considerations:
+
+1. **Referral Extract** - Contains `referral_id`, linked to scheduling via `referral_entity_reltn`
+2. **Future Orders Extract** - Contains `order_id`, linked to scheduling via `sch_order`
+
+The future orders script **excludes** orders that ARE linked to referrals to prevent duplicates:
+```sql
+AND NOT EXISTS (
+    SELECT 1 FROM referral ref 
+    WHERE ref.order_id = ord.order_id 
+    AND ref.active_ind = 1
+)
+```
+
+---
+
 ## Next Steps for CHS Call
 
 Questions to ask CHS:
+
+### For Referrals:
 1. What are the specific values in `referral_status_cd` and their meanings?
 2. What `referral_type_cd` values exist in their system?
 3. How do they track visit/appointment types for referrals?
 4. Are there any custom fields they use for referral categorization?
+
+### For Future Orders (Labs/Imaging):
+5. Confirm which `activity_type_cd` values (code set 106) are used for labs and imaging
+6. What percentage of imaging orders go through scheduling vs. walk-in?
+7. Are there any custom order statuses beyond FUTURE, ORDERED, PENDING, COMPLETED?
+8. Do they use `originating_encntr_id` to track where ambulatory orders originated?
+
+### For Scope Clarification:
+9. What types of "referrals" does your analysis need to include?
+   - Specialist referrals only?
+   - Labs and imaging?
+   - All of the above?
+10. What date range and volume are we looking at?
+
+---
+
+## File Summary
+
+| File | Purpose |
+|------|---------|
+| `cerner_millennium_referral_extract.ccl` | Specialist referrals (from referral table) |
+| `cerner_millennium_future_orders_extract.ccl` | Labs/Imaging orders (from orders table) |
+| `REFERRAL_EXTRACT_README.md` | This documentation |

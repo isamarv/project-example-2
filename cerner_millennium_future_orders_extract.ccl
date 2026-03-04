@@ -1,0 +1,275 @@
+/*******************************************************************************
+* Cerner Millennium - Future Orders Extract (Labs, Imaging, Diagnostics)
+* 
+* Purpose: Extract future/pending orders for labs, imaging, and diagnostic tests
+*          that do NOT go through referral management
+* 
+* Environment: Cerner Millennium (Integrated Ambulatory/Acute)
+* 
+* IMPORTANT: This script captures orders that bypass the referral table:
+*   - Laboratory orders
+*   - Radiology/Imaging orders (X-ray, CT, MRI, Ultrasound, etc.)
+*   - Other diagnostic orders
+*
+* These are typically placed as "future orders" in ambulatory settings and
+* activated when the patient arrives at the hospital/facility for service.
+*
+*******************************************************************************/
+
+SELECT DISTINCT
+    /* Patient Identifiers (with obfuscation for data privacy) */
+      id                           = ea.alias
+    , patient_mrn                  = build(substring(1,3,cnvtstring(rand(0))), pa_mrn.alias, substring(1,3,cnvtstring(rand(0))))
+    , patient_gender               = uar_get_code_meaning(patient.sex_cd)
+    , patient_city                 = a.city
+    , patient_state                = uar_get_code_display(a.state_cd)
+    , patient_zip                  = a.zipcode_key
+    , patient_birthdate            = format(patient.birth_dt_tm, "MM-DD-YYYY;;d")
+
+    /* Order Identification */
+    , order_id                     = build(substring(1,3,cnvtstring(rand(0))), cnvtstring(ord.order_id), substring(1,3,cnvtstring(rand(0))))
+    , order_date                   = format(ord.orig_order_dt_tm, "MM-DD-YYYY;;d")
+    , order_current_start_date     = format(ord.current_start_dt_tm, "MM-DD-YYYY;;d")
+    , order_projected_stop_date    = format(ord.projected_stop_dt_tm, "MM-DD-YYYY;;d")
+
+    /* ========================================================================
+       ORDER TYPE / SERVICE TYPE - What the order is for
+       ======================================================================== */
+    , order_type                   = uar_get_code_display(ord.order_type_cd)
+    , activity_type                = uar_get_code_display(ord.activity_type_cd)
+    , activity_type_meaning        = uar_get_code_meaning(ord.activity_type_cd)
+    , catalog_type                 = uar_get_code_display(ord.catalog_type_cd)
+    , clinical_category            = uar_get_code_display(ord.dcp_clin_cat_cd)
+    
+    /* Order Details */
+    , order_mnemonic               = ord.order_mnemonic
+    , order_catalog_description    = oc.primary_mnemonic
+    , order_catalog_type           = uar_get_code_display(oc.catalog_type_cd)
+    , order_department             = uar_get_code_display(oc.dept_cd)
+    
+    /* CPT/Procedure Codes */
+    , cpt_code                     = oc.cpt_cd
+    , procedure_code               = cnvtstring(ord.catalog_cd, 14, 0)
+
+    /* ========================================================================
+       ORDER STATUS - Current state of the order
+       ======================================================================== */
+    , order_status                 = uar_get_code_display(ord.order_status_cd)
+    , order_status_meaning         = uar_get_code_meaning(ord.order_status_cd)
+    
+    /* Communication/Template Type */
+    , template_order_flag          = ord.template_order_flag
+    , future_order_flag            = 
+          IF (ord.order_status_cd = value(uar_get_code_by('MEANING',6004,'FUTURE')))
+               "Y"
+          ELSE
+               "N"
+          ENDIF
+
+    /* ========================================================================
+       SCHEDULING INFORMATION (if scheduled)
+       ======================================================================== */
+    , schedule_date                = format(sa.beg_dt_tm, "MM-DD-YYYY;;d")
+    , schedule_time                = format(sa.beg_dt_tm, "HH:MM;;Q")
+    , scheduling_status            = uar_get_code_display(sa.sch_state_cd)
+    , scheduled_location           = uar_get_code_display(sa.appt_location_cd)
+    , scheduled_resource           = uar_get_code_display(sa.resource_cd)
+    , scheduling_exists            = 
+          IF (sa.sch_appt_id != null)
+               "Y"
+          ELSE
+               "N"
+          ENDIF
+
+    /* Ordering Provider Information */
+    , ordering_physician_name      = trim(ord_prsnl.name_full_formatted)
+    , ordering_physician_npi       = prsnl_alias_npi.alias
+    , ordering_location            = uar_get_code_display(ord.orig_ord_as_flag)
+
+    /* Service Location (where the order will be performed) */
+    , service_location             = uar_get_code_display(ord.order_locn_cd)
+    , destination_facility         = o_dest.org_name
+
+    /* Originating Encounter (ambulatory visit where order was placed) */
+    , originating_encounter_type   = uar_get_code_display(e_orig.encntr_type_cd)
+    , originating_facility         = uar_get_code_display(e_orig.loc_facility_cd)
+    , originating_location         = uar_get_code_display(e_orig.location_cd)
+    , originating_visit_date       = format(e_orig.reg_dt_tm, "MM-DD-YYYY;;d")
+
+    /* Target Encounter (if order has been associated with service encounter) */
+    , target_encounter_type        = uar_get_code_display(e_tgt.encntr_type_cd)
+    , target_facility              = uar_get_code_display(e_tgt.loc_facility_cd)
+    , target_visit_date            = format(e_tgt.reg_dt_tm, "MM-DD-YYYY;;d")
+
+    /* Order Details/Instructions */
+    , order_comment                = trim(ord.clinical_display_line)
+    , order_detail_display         = trim(ord.simplified_display_line)
+
+    /* Diagnosis/Reason for Order */
+    , diagnosis_code               = nom.source_identifier
+    , diagnosis_description        = nom.source_string
+    , reason_for_exam              = trim(od_reason.oe_field_display_value)
+
+    /* Insurance Information */
+    , insurance1_payer_name        = hp.plan_name
+    , insurance1_financial_class   = uar_get_code_display(bhr.fin_class_cd)
+
+    /* Timestamps */
+    , order_create_date            = format(ord.orig_order_dt_tm, "MM-DD-YYYY;;d")
+    , last_update_date             = format(ord.updt_dt_tm, "MM-DD-YYYY;;d")
+
+FROM
+    orders ord
+
+    /* Order Catalog */
+    ,(INNER JOIN order_catalog oc ON oc.catalog_cd = ord.catalog_cd
+        AND oc.active_ind = 1
+     )
+
+    /* Filter to Lab/Imaging Activity Types */
+    /* This is the KEY filter - adjust based on client's specific code values */
+    ,(INNER JOIN code_value cv_activity ON ord.activity_type_cd = cv_activity.code_value
+        AND cv_activity.code_set = 106
+        AND cv_activity.active_ind = 1
+        AND cv_activity.cdf_meaning IN (
+            'RADIOLOGY'      /* Radiology/Imaging */
+            ,'LABORATORY'    /* Lab orders */
+            ,'PATHOLOGY'     /* Pathology */
+            ,'CARDIOLOGY'    /* Cardiac diagnostics */
+            ,'GENERAL'       /* General diagnostics */
+        )
+     )
+
+    /* Originating Encounter (where order was placed - likely ambulatory) */
+    ,(LEFT JOIN encounter e_orig ON ord.originating_encntr_id = e_orig.encntr_id
+        AND e_orig.active_ind = 1
+     )
+
+    /* Target/Service Encounter (where order will be/was performed) */
+    ,(LEFT JOIN encounter e_tgt ON ord.encntr_id = e_tgt.encntr_id
+        AND e_tgt.active_ind = 1
+        AND e_tgt.encntr_id != ord.originating_encntr_id
+     )
+
+    /* Destination Organization */
+    ,(LEFT JOIN organization o_dest ON ord.dest_locn_cd = o_dest.organization_id)
+
+    /* Order Action - for provider info */
+    ,(LEFT JOIN order_action oa ON ord.order_id = oa.order_id
+        AND oa.action_type_cd = value(uar_get_code_by('MEANING',6003,'ORDER'))
+     )
+
+    /* Ordering Provider */
+    ,(LEFT JOIN prsnl ord_prsnl ON oa.order_provider_id = ord_prsnl.person_id)
+    
+    /* Provider NPI */
+    ,(LEFT JOIN prsnl_alias prsnl_alias_npi ON ord_prsnl.person_id = prsnl_alias_npi.person_id
+        AND prsnl_alias_npi.active_ind = 1
+        AND prsnl_alias_npi.prsnl_alias_type_cd = value(uar_get_code_by('MEANING',320,'NPI'))
+        AND sysdate BETWEEN prsnl_alias_npi.beg_effective_dt_tm AND prsnl_alias_npi.end_effective_dt_tm
+     )
+
+    /* Order Detail - Reason for Exam */
+    ,(LEFT JOIN order_detail od_reason ON ord.order_id = od_reason.order_id
+        AND od_reason.oe_field_meaning_id IN (
+            SELECT oef.oe_field_meaning_id 
+            FROM oe_format_fields oef 
+            WHERE oef.description IN ('Reason for Exam', 'Reason For Exam', 'Clinical Indication')
+        )
+     )
+
+    /* Diagnosis linked to order */
+    ,(LEFT JOIN order_diagnosis ordx ON ord.order_id = ordx.order_id
+        AND ordx.active_ind = 1
+     )
+    ,(LEFT JOIN nomenclature nom ON ordx.nomenclature_id = nom.nomenclature_id
+        AND nom.active_ind = 1
+     )
+
+    /* Scheduling - if order has been scheduled */
+    ,(LEFT JOIN sch_order so ON ord.order_id = so.order_id
+        AND so.active_ind = 1
+     )
+    ,(LEFT JOIN sch_event_attach sea ON so.sch_order_id = sea.sch_order_id
+        AND sea.active_ind = 1
+     )
+    ,(LEFT JOIN sch_event se ON sea.sch_event_id = se.sch_event_id
+        AND se.active_ind = 1
+        AND sysdate BETWEEN se.beg_effective_dt_tm AND se.end_effective_dt_tm
+     )
+    ,(LEFT JOIN sch_appt sa ON sa.sch_event_id = se.sch_event_id
+        AND sa.active_ind = 1
+        AND sysdate BETWEEN sa.beg_effective_dt_tm AND sa.end_effective_dt_tm
+        AND sa.sch_role_cd = value(uar_get_code_by('MEANING',14250,'PATIENT'))
+        AND sa.schedule_seq = (
+            SELECT max(s2.schedule_seq) 
+            FROM sch_appt s2 
+            WHERE s2.sch_event_id = sa.sch_event_id
+            AND s2.active_ind = 1
+        )
+     )
+
+    /* Patient Financial Information */
+    ,(LEFT JOIN pft_encntr pe ON pe.encntr_id = e_orig.encntr_id)
+    ,(LEFT JOIN benefit_order bo ON pe.pft_encntr_id = bo.pft_encntr_id)
+    ,(LEFT JOIN bo_hp_reltn bhr ON bo.benefit_order_id = bhr.benefit_order_id
+        AND bhr.priority_seq = 1
+     )
+    ,(LEFT JOIN health_plan hp ON bhr.health_plan_id = hp.health_plan_id)
+
+    /* Patient Address */
+    ,(LEFT JOIN address a ON a.parent_entity_id = ord.person_id
+        AND a.parent_entity_name = "PERSON"
+        AND a.active_ind = 1
+        AND a.address_type_seq = 1
+        AND a.address_type_cd = value(uar_get_code_by('MEANING',212,'HOME'))
+     )
+
+    /* Encounter Alias (FIN) - from originating encounter */
+    ,(LEFT JOIN encntr_alias ea ON e_orig.encntr_id = ea.encntr_id
+        AND ea.active_ind = 1
+        AND sysdate BETWEEN ea.beg_effective_dt_tm AND ea.end_effective_dt_tm
+        AND ea.data_status_cd = value(uar_get_code_by("MEANING",8,"AUTH"))
+        AND ea.encntr_alias_type_cd = value(uar_get_code_by("MEANING",319,"FIN NBR"))
+     )
+
+    /* Patient Demographics */
+    ,(INNER JOIN person patient ON ord.person_id = patient.person_id
+        AND patient.active_ind = 1
+        AND patient.birth_dt_tm IS NOT NULL
+        AND patient.name_last_key NOT IN ("ZZ*", "ZZTEST*", "TEST*")
+     )
+
+    /* Patient MRN */
+    ,(LEFT JOIN person_alias pa_mrn ON ord.person_id = pa_mrn.person_id
+        AND pa_mrn.active_ind = 1
+        AND pa_mrn.person_alias_type_cd = value(uar_get_code_by('MEANING', 4, 'MRN'))
+        AND sysdate BETWEEN pa_mrn.beg_effective_dt_tm AND pa_mrn.end_effective_dt_tm
+     )
+
+WHERE ord.active_ind = 1
+    /* Include Future orders and other relevant statuses */
+    AND ord.order_status_cd IN (
+        value(uar_get_code_by('MEANING',6004,'FUTURE'))      /* Future orders */
+        ,value(uar_get_code_by('MEANING',6004,'ORDERED'))    /* Active orders */
+        ,value(uar_get_code_by('MEANING',6004,'PENDING'))    /* Pending orders */
+        ,value(uar_get_code_by('MEANING',6004,'COMPLETED'))  /* Completed orders */
+    )
+    /* Date range filter - adjust as needed */
+    AND ord.orig_order_dt_tm BETWEEN cnvtdatetime("01-DEC-2025 00:00:00") 
+                                 AND cnvtdatetime("31-DEC-2025 23:59:59")
+    /* Exclude orders that ARE linked to referrals (those are in the other extract) */
+    AND NOT EXISTS (
+        SELECT 1 FROM referral ref 
+        WHERE ref.order_id = ord.order_id 
+        AND ref.active_ind = 1
+    )
+
+ORDER BY 
+    ord.person_id
+    , ord.orig_order_dt_tm
+
+WITH maxrec = 500000
+    , time = 600
+    , format(date,";;d")
+GO
