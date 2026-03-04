@@ -206,34 +206,56 @@ SELECT INTO "your_output_file.csv"
 
 The `cerner_millennium_future_orders_extract.ccl` script captures orders that bypass the referral table.
 
+### Critical Architecture Note
+
+**Future orders FLOAT at the PATIENT LEVEL, not encounter level.**
+
+This means:
+- Future orders are tied to `person_id` (patient), NOT to a specific encounter
+- The `encntr_id` on the order is **only populated when the order is activated/performed**
+- You cannot trace a future order back to the ambulatory visit where it was placed
+- The `originating_encntr_id` field is NOT used for future orders
+
+### Activity Type is at ORDER CATALOG Level
+
+The `activity_type_cd` that identifies labs vs. imaging is defined on the **order_catalog** table, NOT the orders table:
+```sql
+-- CORRECT: Filter on order_catalog.activity_type_cd
+INNER JOIN code_value cv_activity ON oc.activity_type_cd = cv_activity.code_value
+
+-- WRONG: orders.activity_type_cd may not have the same value
+```
+
 ### Key Fields in Future Orders Extract
 
 | Field | Description |
 |-------|-------------|
 | `order_type` | Type of order |
-| `activity_type` | Activity classification (RADIOLOGY, LABORATORY, etc.) |
+| `activity_type` | Activity classification from ORDER CATALOG (RADIOLOGY, LABORATORY, etc.) |
 | `clinical_category` | Clinical category of the service |
 | `order_status` | Current status (FUTURE, ORDERED, PENDING, COMPLETED) |
 | `future_order_flag` | Y/N indicator if this is a future order |
+| `order_has_encounter` | Y/N indicator if order has been tied to an encounter yet |
 | `scheduling_exists` | Y/N indicator if order has been scheduled |
 | `scheduling_status` | Status of appointment (if scheduled) |
 
 ### Activity Types Captured
 
-The future orders script filters on these activity type meanings (code set 106):
-- `RADIOLOGY` - Imaging orders
+The future orders script filters on these activity type meanings (code set 106) **at the order_catalog level**:
+- `RADIOLOGY` - Imaging orders (CT, MRI, X-ray, Ultrasound)
 - `LABORATORY` - Lab orders
 - `PATHOLOGY` - Pathology orders
 - `CARDIOLOGY` - Cardiac diagnostics
 - `GENERAL` - General diagnostics
 
-**Note:** You may need to adjust these based on CHS's specific code set values.
+**Note:** You may need to adjust these based on CHS's specific code set values in their order catalog.
 
-### Linking Ambulatory to Acute
+### Understanding the Patient-Level Float
 
-The script tracks both:
-- **Originating Encounter** (`originating_encntr_id`) - The ambulatory visit where order was placed
-- **Target Encounter** (`encntr_id`) - The hospital encounter where service is performed
+| Order State | `encntr_id` | `order_has_encounter` | What This Means |
+|-------------|-------------|----------------------|-----------------|
+| Future (not yet performed) | 0 or NULL | N | Order floating at patient level |
+| Activated/Performed | Valid ID | Y | Order tied to service encounter |
 
 ---
 
@@ -257,26 +279,26 @@ AND NOT EXISTS (
 
 ## Next Steps for CHS Call
 
-Questions to ask CHS:
+### Already Clarified:
+- ✅ **Scope:** Need BOTH referral orders AND labs/imaging (future orders)
+- ✅ **Future orders float at patient level** - NOT tied to originating encounter
+- ✅ **Activity type is at order catalog level** - Filter on `order_catalog.activity_type_cd`
 
-### For Referrals:
+### Remaining Questions for CHS:
+
+#### For Referrals:
 1. What are the specific values in `referral_status_cd` and their meanings?
 2. What `referral_type_cd` values exist in their system?
 3. How do they track visit/appointment types for referrals?
-4. Are there any custom fields they use for referral categorization?
 
-### For Future Orders (Labs/Imaging):
-5. Confirm which `activity_type_cd` values (code set 106) are used for labs and imaging
-6. What percentage of imaging orders go through scheduling vs. walk-in?
-7. Are there any custom order statuses beyond FUTURE, ORDERED, PENDING, COMPLETED?
-8. Do they use `originating_encntr_id` to track where ambulatory orders originated?
+#### For Future Orders (Labs/Imaging):
+4. Can you provide a list of the `activity_type_cd` values in code set 106 from their order_catalog?
+5. What percentage of CT/MRI orders go through scheduling vs. walk-in?
+6. Are there any custom order statuses beyond FUTURE, ORDERED, PENDING, COMPLETED?
 
-### For Scope Clarification:
-9. What types of "referrals" does your analysis need to include?
-   - Specialist referrals only?
-   - Labs and imaging?
-   - All of the above?
-10. What date range and volume are we looking at?
+#### For Data Scope:
+7. What date range and volume are we looking at?
+8. Do you need both completed AND pending/future orders, or just one category?
 
 ---
 

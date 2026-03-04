@@ -11,8 +11,11 @@
 *   - Radiology/Imaging orders (X-ray, CT, MRI, Ultrasound, etc.)
 *   - Other diagnostic orders
 *
-* These are typically placed as "future orders" in ambulatory settings and
-* activated when the patient arrives at the hospital/facility for service.
+* KEY ARCHITECTURE NOTES:
+*   - Future orders FLOAT at the PATIENT LEVEL, not encounter level
+*   - They are NOT tied to originating_encntr_id
+*   - Activity type filtering is done at ORDER CATALOG level (oc.activity_type_cd)
+*   - Orders become active when patient arrives for service
 *
 *******************************************************************************/
 
@@ -34,11 +37,12 @@ SELECT DISTINCT
 
     /* ========================================================================
        ORDER TYPE / SERVICE TYPE - What the order is for
+       Activity type is defined at ORDER CATALOG level
        ======================================================================== */
     , order_type                   = uar_get_code_display(ord.order_type_cd)
-    , activity_type                = uar_get_code_display(ord.activity_type_cd)
-    , activity_type_meaning        = uar_get_code_meaning(ord.activity_type_cd)
-    , catalog_type                 = uar_get_code_display(ord.catalog_type_cd)
+    , activity_type                = uar_get_code_display(oc.activity_type_cd)
+    , activity_type_meaning        = uar_get_code_meaning(oc.activity_type_cd)
+    , catalog_type                 = uar_get_code_display(oc.catalog_type_cd)
     , clinical_category            = uar_get_code_display(ord.dcp_clin_cat_cd)
     
     /* Order Details */
@@ -90,16 +94,22 @@ SELECT DISTINCT
     , service_location             = uar_get_code_display(ord.order_locn_cd)
     , destination_facility         = o_dest.org_name
 
-    /* Originating Encounter (ambulatory visit where order was placed) */
-    , originating_encounter_type   = uar_get_code_display(e_orig.encntr_type_cd)
-    , originating_facility         = uar_get_code_display(e_orig.loc_facility_cd)
-    , originating_location         = uar_get_code_display(e_orig.location_cd)
-    , originating_visit_date       = format(e_orig.reg_dt_tm, "MM-DD-YYYY;;d")
-
-    /* Target Encounter (if order has been associated with service encounter) */
-    , target_encounter_type        = uar_get_code_display(e_tgt.encntr_type_cd)
-    , target_facility              = uar_get_code_display(e_tgt.loc_facility_cd)
-    , target_visit_date            = format(e_tgt.reg_dt_tm, "MM-DD-YYYY;;d")
+    /* ========================================================================
+       ENCOUNTER INFORMATION
+       NOTE: Future orders FLOAT at PATIENT LEVEL - they are NOT tied to
+       a specific originating encounter. The encntr_id on the order is only
+       populated when the order is activated/performed.
+       ======================================================================== */
+    /* Service Encounter (populated when order is activated/performed) */
+    , service_encounter_type       = uar_get_code_display(e_svc.encntr_type_cd)
+    , service_facility             = uar_get_code_display(e_svc.loc_facility_cd)
+    , service_visit_date           = format(e_svc.reg_dt_tm, "MM-DD-YYYY;;d")
+    , order_has_encounter          = 
+          IF (ord.encntr_id != 0 AND ord.encntr_id != null)
+               "Y"
+          ELSE
+               "N - Floating at Patient Level"
+          ENDIF
 
     /* Order Details/Instructions */
     , order_comment                = trim(ord.clinical_display_line)
@@ -121,18 +131,18 @@ SELECT DISTINCT
 FROM
     orders ord
 
-    /* Order Catalog */
+    /* Order Catalog - Activity type is defined HERE at catalog level */
     ,(INNER JOIN order_catalog oc ON oc.catalog_cd = ord.catalog_cd
         AND oc.active_ind = 1
      )
 
-    /* Filter to Lab/Imaging Activity Types */
-    /* This is the KEY filter - adjust based on client's specific code values */
-    ,(INNER JOIN code_value cv_activity ON ord.activity_type_cd = cv_activity.code_value
+    /* Filter to Lab/Imaging Activity Types - FROM ORDER CATALOG */
+    /* This is the KEY filter - activity_type_cd is at catalog level */
+    ,(INNER JOIN code_value cv_activity ON oc.activity_type_cd = cv_activity.code_value
         AND cv_activity.code_set = 106
         AND cv_activity.active_ind = 1
         AND cv_activity.cdf_meaning IN (
-            'RADIOLOGY'      /* Radiology/Imaging */
+            'RADIOLOGY'      /* Radiology/Imaging (CT, MRI, X-ray, etc.) */
             ,'LABORATORY'    /* Lab orders */
             ,'PATHOLOGY'     /* Pathology */
             ,'CARDIOLOGY'    /* Cardiac diagnostics */
@@ -140,15 +150,11 @@ FROM
         )
      )
 
-    /* Originating Encounter (where order was placed - likely ambulatory) */
-    ,(LEFT JOIN encounter e_orig ON ord.originating_encntr_id = e_orig.encntr_id
-        AND e_orig.active_ind = 1
-     )
-
-    /* Target/Service Encounter (where order will be/was performed) */
-    ,(LEFT JOIN encounter e_tgt ON ord.encntr_id = e_tgt.encntr_id
-        AND e_tgt.active_ind = 1
-        AND e_tgt.encntr_id != ord.originating_encntr_id
+    /* Service Encounter - Only populated when order is activated/performed */
+    /* NOTE: Future orders FLOAT at patient level - encntr_id may be 0/null */
+    ,(LEFT JOIN encounter e_svc ON ord.encntr_id = e_svc.encntr_id
+        AND e_svc.active_ind = 1
+        AND ord.encntr_id != 0
      )
 
     /* Destination Organization */
@@ -209,8 +215,8 @@ FROM
         )
      )
 
-    /* Patient Financial Information */
-    ,(LEFT JOIN pft_encntr pe ON pe.encntr_id = e_orig.encntr_id)
+    /* Patient Financial Information - from service encounter if exists */
+    ,(LEFT JOIN pft_encntr pe ON pe.encntr_id = e_svc.encntr_id)
     ,(LEFT JOIN benefit_order bo ON pe.pft_encntr_id = bo.pft_encntr_id)
     ,(LEFT JOIN bo_hp_reltn bhr ON bo.benefit_order_id = bhr.benefit_order_id
         AND bhr.priority_seq = 1
@@ -225,8 +231,8 @@ FROM
         AND a.address_type_cd = value(uar_get_code_by('MEANING',212,'HOME'))
      )
 
-    /* Encounter Alias (FIN) - from originating encounter */
-    ,(LEFT JOIN encntr_alias ea ON e_orig.encntr_id = ea.encntr_id
+    /* Encounter Alias (FIN) - from service encounter if exists */
+    ,(LEFT JOIN encntr_alias ea ON e_svc.encntr_id = ea.encntr_id
         AND ea.active_ind = 1
         AND sysdate BETWEEN ea.beg_effective_dt_tm AND ea.end_effective_dt_tm
         AND ea.data_status_cd = value(uar_get_code_by("MEANING",8,"AUTH"))
