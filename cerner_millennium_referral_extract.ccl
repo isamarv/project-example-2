@@ -1,0 +1,283 @@
+/*******************************************************************************
+* Cerner Millennium - Referral Data Extract
+* 
+* Purpose: Extract referral data with visit type, statuses, and related information
+* Environment: Cerner Millennium
+* 
+* Key Fields Added:
+*   - referral_type: Identifies the type/purpose of the referral
+*   - encounter_type: Identifies the visit/encounter type
+*   - referral_reason: Captures the reason for referral
+*
+* Status Fields Explanation:
+*   1. referral_status_cd - Status of the referral record itself
+*      (e.g., Pending, Approved, Denied, Completed, Cancelled)
+*   2. order_status_cd - Status of the underlying order
+*      (e.g., Ordered, Completed, Discontinued, Canceled)
+*   3. scheduling_status - Status of any linked appointment
+*      (e.g., Scheduled, Confirmed, Checked-In, Completed, No-Show)
+*
+*******************************************************************************/
+
+SELECT DISTINCT
+    /* Patient Identifiers (with obfuscation for data privacy) */
+      id                           = ea.alias
+    , patient_mrn                  = build(substring(1,3,cnvtstring(rand(0))), pa_mrn.alias, substring(1,3,cnvtstring(rand(0))))
+    , patient_gender               = uar_get_code_meaning(patient.sex_cd)
+    , patient_city                 = a.city
+    , patient_state                = uar_get_code_display(a.state_cd)
+    , patient_zip                  = a.zipcode_key
+    , patient_birthdate            = format(patient.birth_dt_tm, "MM-DD-YYYY;;d")
+
+    /* Order Information */
+    , order_id                     = build(substring(1,3,cnvtstring(rand(0))), cnvtstring(r.order_id), substring(1,3,cnvtstring(rand(0))))
+    , order_date                   = format(ord.orig_order_dt_tm, "MM-DD-YYYY;;d")
+    , order_proc_code              = cnvtstring(ord.catalog_cd, 14, 0)
+    , order_proc_code_description  = oc.primary_mnemonic
+
+    /* Charge/Billing Codes */
+    , cpt_code                     = cmCPT.field6
+    , charge_description           = c.charge_description
+    , dx_code                      = cmICD.field6
+
+    /* ========================================================================
+       VISIT TYPE / REFERRAL TYPE FIELDS - Addresses Team Concern #1
+       These fields help identify what the referral is for
+       ======================================================================== */
+    , referral_type                = uar_get_code_display(r.referral_type_cd)
+    , encounter_type               = uar_get_code_display(e.encntr_type_cd)
+    , encounter_type_class         = uar_get_code_display(e.encntr_type_class_cd)
+    , referral_reason              = r.reason_for_referral
+    , service_category             = uar_get_code_display(ord.dcp_clin_cat_cd)
+    , referral_class               = uar_get_code_display(ord.activity_type_cd)
+    , catalog_type                 = uar_get_code_display(ord.catalog_type_cd)
+    
+    /* ========================================================================
+       STATUS FIELDS - Addresses Team Concern #2 (3 Statuses)
+       ======================================================================== */
+    /* Status 1: Referral Status - The status of the referral record itself */
+    , referral_status_cd           = uar_get_code_display(r.referral_status_cd)
+    
+    /* Status 2: Order Status - The status of the underlying clinical order */
+    , order_status_cd              = uar_get_code_display(ord.order_status_cd)
+    
+    /* Status 3: Scheduling Status - The status of any linked appointment */
+    , scheduling_status            = uar_get_code_display(sa.sch_state_cd)
+
+    /* Order Expiration */
+    , order_expiration_date        =
+          IF (ord.projected_stop_dt_tm != null)
+               format(ord.projected_stop_dt_tm, "MM-DD-YYYY;;d")
+          ELSEIF (ord.orig_order_dt_tm != null)
+               format(ord.orig_order_dt_tm + 365, "MM-DD-YYYY;;d")
+          ENDIF
+
+    /* Referring Provider Information */
+    , ordering_physician_name      = trim(rfrom.name_full_formatted)
+    , ordering_physician_npi       = prsnl_alias_npi.alias
+    
+    /* Referral Identifiers */
+    , referral_id                  = cnvtstring(r.referral_id, 14, 0)
+
+    /* Referred To Location Details */
+    , referred_to_location         = o2.org_name
+    , referred_to_location_address = a2.street_addr
+    , referred_to_location_city    = a2.city
+    , referred_to_location_department = uar_get_code_display(ord.catalog_type_cd)
+    , referred_to_location_state   = uar_get_code_display(a2.state_cd)
+    , referred_to_location_zip     = a2.zipcode_key
+    , referred_to_location_phone   = ph.phone_num_key
+
+    /* Referring From Location Details */
+    , department_category          = o.org_name
+    , location                     = uar_get_code_display(r.refer_from_loc_cd)
+    , location_address             = a3.street_addr
+    , location_city                = a3.city
+    , location_state               = uar_get_code_display(a3.state_cd)
+    , location_zip                 = a3.zipcode_key
+
+    /* Encounter/Scheduling Dates */
+    , admit_date                   = format(e.reg_dt_tm, "MM-DD-YYYY;;d")
+    , encounter_begin_date         = format(e.beg_dt_tm, "MM-DD-YYYY;;d")
+    , schedule_date                = format(sa.beg_dt_tm, "MM-DD-YYYY;;d")
+
+    /* Insurance Information */
+    , insurance1_payer_name        = hp.plan_name
+    , insurance1_financial_class   = uar_get_code_display(bhr.fin_class_cd)
+
+FROM
+    referral r
+
+    /* Orders - Using LEFT JOIN to not lose referrals without orders */
+    ,(LEFT JOIN orders ord ON ord.order_id = r.order_id
+        AND ord.orig_order_dt_tm >= cnvtlookbehind("1,Y")
+        AND ord.activity_type_cd NOT IN (
+            value(uar_get_code_by('MEANING',106,'NURS'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'NURSINGFACLTY'))
+            ,value(uar_get_code_by('MEANING',106,'SCHEDULING'))
+            ,value(uar_get_code_by('MEANING',106,'PHARMACY'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'PATHOLAB'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'CARDIOVASMED'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'MEDICATIONRELATED'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'INTERNALMEDICINECONSULTS'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'PHYMEDREHAB'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'SLEEPMEDICINE'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'TELEMEDICINE'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'CASEMGMT'))
+            ,value(uar_get_code_by('MEANING',106,'DIETARY'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'NUTRITIONSERVICESCONSULTS'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'NUTRITIONISTCONSULTS'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'NUTRITION'))
+            ,value(uar_get_code_by('DISPLAYKEY',106,'NUTRITIONEDUCATION'))
+        )
+     )
+
+    /* Order Catalog for procedure descriptions */
+    ,(LEFT JOIN order_catalog oc ON oc.catalog_cd = ord.catalog_cd)
+
+    /* Order Action for linking to charges */
+    ,(LEFT JOIN order_action oa ON ord.order_id = oa.order_id
+        AND oa.action_type_cd = value(uar_get_code_by('MEANING',6003,'ORDER'))
+     )
+
+    /* Charge Information */
+    ,(LEFT JOIN charge c ON c.encntr_id = ord.encntr_id
+        AND c.order_id = ord.order_id
+        AND c.active_ind = 1
+     )
+
+    /* CPT Codes from charge_mod */
+    ,(LEFT JOIN charge_mod cmCPT ON c.charge_item_id = cmCPT.charge_item_id
+        AND cmCPT.active_ind = 1
+        AND cmCPT.field2_id = 1
+        AND cmCPT.field1_id IN (
+            SELECT cv.code_value FROM code_value cv
+            WHERE cv.code_set = 14002 
+            AND cv.cdf_meaning = "CPT4"
+            AND cv.active_ind = 1
+        )
+     )
+
+    /* ICD Diagnosis Codes from charge_mod */
+    ,(LEFT JOIN charge_mod cmICD ON c.charge_item_id = cmICD.charge_item_id
+        AND cmICD.active_ind = 1
+        AND cmICD.field2_id = 1
+        AND cmICD.field1_id IN (
+            SELECT cv.code_value FROM code_value cv
+            WHERE cv.code_set = 14002 
+            AND cv.cdf_meaning IN ("ICD9", "ICD10")
+            AND cv.active_ind = 1
+        )
+     )
+
+    /* Referring FROM Organization */
+    ,(LEFT JOIN organization o ON r.refer_from_organization_id = o.organization_id)
+    ,(LEFT JOIN address a3 ON a3.parent_entity_id = o.organization_id
+        AND a3.parent_entity_name = "ORGANIZATION"
+        AND a3.active_ind = 1
+        AND a3.address_type_seq = 1
+     )
+
+    /* Referred TO Organization */
+    ,(LEFT JOIN organization o2 ON r.refer_to_organization_id = o2.organization_id)
+    ,(LEFT JOIN address a2 ON a2.parent_entity_id = o2.organization_id
+        AND a2.parent_entity_name = "ORGANIZATION"
+        AND a2.active_ind = 1
+        AND a2.address_type_seq = 1
+     )
+
+    /* Phone for Referred TO Organization */
+    ,(LEFT JOIN phone ph ON ph.parent_entity_id = o2.organization_id
+        AND ph.parent_entity_name = "ORGANIZATION"
+        AND ph.active_ind = 1
+        AND ph.phone_type_seq = 1
+     )
+
+    /* Scheduling Information */
+    ,(LEFT JOIN referral_entity_reltn rer ON rer.referral_id = r.referral_id
+        AND rer.parent_entity_name = "SCH_EVENT"
+        AND rer.active_ind = 1
+     )
+    ,(LEFT JOIN sch_event se ON se.sch_event_id = rer.parent_entity_id
+        AND se.active_ind = 1
+        AND sysdate BETWEEN se.beg_effective_dt_tm AND se.end_effective_dt_tm
+     )
+    ,(LEFT JOIN sch_appt sa ON sa.sch_event_id = se.sch_event_id
+        AND sa.active_ind = 1
+        AND sysdate BETWEEN sa.beg_effective_dt_tm AND sa.end_effective_dt_tm
+        AND sa.sch_role_cd = value(uar_get_code_by('MEANING',14250,'PATIENT'))
+        AND sa.schedule_seq = (
+            SELECT max(s2.schedule_seq) 
+            FROM sch_appt s2 
+            WHERE s2.sch_event_id = sa.sch_event_id
+            AND s2.active_ind = 1
+        )
+     )
+
+    /* Referring Provider */
+    ,(LEFT JOIN prsnl rfrom ON r.refer_from_provider_id = rfrom.person_id)
+    
+    /* Provider NPI */
+    ,(LEFT JOIN prsnl_alias prsnl_alias_npi ON rfrom.person_id = prsnl_alias_npi.person_id
+        AND prsnl_alias_npi.active_ind = 1
+        AND prsnl_alias_npi.prsnl_alias_type_cd = value(uar_get_code_by('MEANING',320,'NPI'))
+        AND sysdate BETWEEN prsnl_alias_npi.beg_effective_dt_tm AND prsnl_alias_npi.end_effective_dt_tm
+     )
+
+    /* Encounter - Using proper encntr_id relationship */
+    ,(LEFT JOIN encounter e ON r.encntr_id = e.encntr_id
+        AND e.active_ind = 1
+        AND e.encntr_status_cd != value(uar_get_code_by("MEANING",261,"CANCELLED"))
+     )
+
+    /* Patient Financial Information */
+    ,(LEFT JOIN pft_encntr pe ON pe.encntr_id = e.encntr_id)
+    ,(LEFT JOIN benefit_order bo ON pe.pft_encntr_id = bo.pft_encntr_id)
+    ,(LEFT JOIN bo_hp_reltn bhr ON bo.benefit_order_id = bhr.benefit_order_id
+        AND bhr.priority_seq = 1
+     )
+    ,(LEFT JOIN health_plan hp ON bhr.health_plan_id = hp.health_plan_id)
+
+    /* Patient Address */
+    ,(LEFT JOIN address a ON a.parent_entity_id = r.person_id
+        AND a.parent_entity_name = "PERSON"
+        AND a.active_ind = 1
+        AND a.address_type_seq = 1
+        AND a.address_type_cd = value(uar_get_code_by('MEANING',212,'HOME'))
+     )
+
+    /* Encounter Alias (FIN) */
+    ,(LEFT JOIN encntr_alias ea ON e.encntr_id = ea.encntr_id
+        AND ea.active_ind = 1
+        AND sysdate BETWEEN ea.beg_effective_dt_tm AND ea.end_effective_dt_tm
+        AND ea.data_status_cd = value(uar_get_code_by("MEANING",8,"AUTH"))
+        AND ea.encntr_alias_type_cd = value(uar_get_code_by("MEANING",319,"FIN NBR"))
+     )
+
+    /* Patient Demographics */
+    ,(INNER JOIN person patient ON r.person_id = patient.person_id
+        AND patient.active_ind = 1
+        AND patient.birth_dt_tm IS NOT NULL
+        AND patient.name_last_key NOT IN ("ZZ*", "ZZTEST*", "TEST*")
+     )
+
+    /* Patient MRN - CORRECTED: Using person_alias instead of encntr_alias */
+    ,(LEFT JOIN person_alias pa_mrn ON r.person_id = pa_mrn.person_id
+        AND pa_mrn.active_ind = 1
+        AND pa_mrn.person_alias_type_cd = value(uar_get_code_by('MEANING', 4, 'MRN'))
+        AND sysdate BETWEEN pa_mrn.beg_effective_dt_tm AND pa_mrn.end_effective_dt_tm
+     )
+
+WHERE r.active_ind = 1
+    /* Date range filter - adjust as needed */
+    AND r.create_dt_tm BETWEEN cnvtdatetime("01-DEC-2025 00:00:00") 
+                           AND cnvtdatetime("31-DEC-2025 23:59:59")
+
+ORDER BY 
+    r.referral_id
+    , e.encntr_id
+
+WITH maxrec = 500000
+    , time = 600
+    , format(date,";;d")
+GO
